@@ -1,7 +1,7 @@
 """Preprocess chess game data from CSV for machine learning.
 
 This script:
-1. Loads the extracted chess games CSV
+1. Loads the extracted chess games CSV (with ratings)
 2. Explores and displays data statistics
 3. Encodes categorical features (player names, openings) to discrete integer values
 4. Saves encoded data and encoders for later use
@@ -109,6 +109,8 @@ def select_ml_features(df_encoded: pd.DataFrame) -> pd.DataFrame:
         "white_player_id": df_encoded["white_player_encoded"],
         "black_player_id": df_encoded["black_player_encoded"],
         "opening_id": df_encoded["opening_encoded"],
+        "white_rating": df_encoded["white_rating"],
+        "black_rating": df_encoded["black_rating"],
         "winning_color": df_encoded["winning_color_encoded"],
         "result_code": df_encoded["result_encoded"],
         "winner_id": df_encoded["winner_encoded"],
@@ -126,6 +128,16 @@ def main() -> None:
     # Load CSV
     print(f"Loading data from {args.input}...")
     df = pd.read_csv(args.input)
+    
+    # Convert ratings to numeric and fill missing with median
+    df['white_rating'] = pd.to_numeric(df['white_rating'], errors='coerce')
+    df['black_rating'] = pd.to_numeric(df['black_rating'], errors='coerce')
+    
+    median_white = df['white_rating'].median()
+    median_black = df['black_rating'].median()
+    
+    df['white_rating'] = df['white_rating'].fillna(median_white).astype(int)
+    df['black_rating'] = df['black_rating'].fillna(median_black).astype(int)
     
     # Explore data
     explore_data(df)
@@ -147,6 +159,9 @@ def main() -> None:
     
     print(f"\nFinal ML dataset shape: {ml_df.shape}")
     print(f"Final ML dataset preview:\n{ml_df.head(10)}")
+    print(f"\nRating statistics:")
+    print(f"  White rating - Mean: {ml_df['white_rating'].mean():.1f}, Std: {ml_df['white_rating'].std():.1f}")
+    print(f"  Black rating - Mean: {ml_df['black_rating'].mean():.1f}, Std: {ml_df['black_rating'].std():.1f}")
 
 
 if __name__ == "__main__":

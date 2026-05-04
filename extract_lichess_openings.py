@@ -2,6 +2,7 @@
 
 This script reads a PGN export from Lichess and writes one row per game with:
 - player names
+- ratings (ELO)
 - opening name
 - game result
 - winner and loser names derived from the result
@@ -57,6 +58,8 @@ def extract_games(pgn_path: Path) -> list[dict[str, str]]:
 
             white_player = game.headers.get("White", "")
             black_player = game.headers.get("Black", "")
+            white_elo = game.headers.get("WhiteElo", "")
+            black_elo = game.headers.get("BlackElo", "")
             opening = game.headers.get("Opening", "")
             result = game.headers.get("Result", "")
 
@@ -70,6 +73,8 @@ def extract_games(pgn_path: Path) -> list[dict[str, str]]:
                 {
                     "white_player": white_player,
                     "black_player": black_player,
+                    "white_rating": white_elo,
+                    "black_rating": black_elo,
                     "opening": opening,
                     "result": result,
                     "winning_color": winning_color,
@@ -85,6 +90,8 @@ def write_csv(rows: list[dict[str, str]], output_path: Path) -> None:
     fieldnames = [
         "white_player",
         "black_player",
+        "white_rating",
+        "black_rating",
         "opening",
         "result",
         "winning_color",
