@@ -9,6 +9,8 @@ This script reads a PGN export from Lichess and writes one row per game with:
 
 Usage:
     python extract_lichess_openings.py --input lichess.pgn --output games.csv
+
+The output CSV is appended to if it already exists.
 """
 
 from __future__ import annotations
@@ -99,9 +101,12 @@ def write_csv(rows: list[dict[str, str]], output_path: Path) -> None:
         "loser",
     ]
 
-    with output_path.open("w", newline="", encoding="utf-8") as csv_file:
+    file_exists = output_path.exists()
+    mode = "a" if file_exists else "w"
+    with output_path.open(mode, newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
+        if not file_exists or output_path.stat().st_size == 0:
+            writer.writeheader()
         writer.writerows(rows)
 
 

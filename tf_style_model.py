@@ -6,7 +6,12 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.backends.mps.is_available():
+    device = torch.device('mps')
+elif torch.cuda.is_available():
+    device = torch.device('cuda')
+else:
+    device = torch.device('cpu')
 print(f"Using device: {device}")
 
 # Hyperparameters
@@ -67,6 +72,12 @@ class TFStyleChessModel(nn.Module):
         ], dim=1)  # [B, 9]
         
         return self.dense(x)
+
+
+def count_parameters(model: nn.Module) -> tuple[int, int]:
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
 
 def collate_fn(batch):
     """Custom collate function"""
@@ -204,6 +215,9 @@ def main():
     
     print(f"\nModel architecture:")
     print(model)
+    total_params, trainable_params = count_parameters(model)
+    print(f"Total params: {total_params}")
+    print(f"Trainable params: {trainable_params}")
     
     # Training setup
     criterion = nn.CrossEntropyLoss()
