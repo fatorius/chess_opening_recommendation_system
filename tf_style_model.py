@@ -1,10 +1,16 @@
+"""Train player + opening embeddings via implicit-feedback matrix factorization.
+
+Proxy task: given (player_id, opening_id), did this player play this opening?
+Positives are observed games (each game contributes one row per color).
+Negatives are random openings paired with the same player.
+"""
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import pandas as pd
-import numpy as np
 from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
 
 if torch.backends.mps.is_available():
     device = torch.device('mps')
@@ -14,64 +20,42 @@ else:
     device = torch.device('cpu')
 print(f"Using device: {device}")
 
-# Hyperparameters
 EMBEDDING_DIM = 32
-BATCH_SIZE = 32
-EPOCHS = 50
-LEARNING_RATE = 0.001
-VAL_SPLIT = 0.2
+BATCH_SIZE = 1024
+EPOCHS = 30
+LEARNING_RATE = 5e-3
+WEIGHT_DECAY = 1e-6
+NEG_PER_POS = 4
+VAL_SPLIT = 0.1
 
-class ChessDataset(Dataset):
-    """Dataset for single-player proxy training samples"""
-    def __init__(self, players, openings, results, ratings):
-        if ratings is None:
-            raise ValueError("ratings are required for this model.")
-        self.players = players
-        self.openings = openings
-        self.results = results
-        self.ratings = ratings
-        
-    def __len__(self):
-        return len(self.results)
-    
-    def __getitem__(self, idx):
-        return {
-            'player': self.players[idx],
-            'opening': self.openings[idx],
-            'rating': self.ratings[idx],
-            'result': self.results[idx]
-        }
 
-class TFStyleChessModel(nn.Module):
-    """TensorFlow-style architecture in PyTorch"""
-    def __init__(self, num_players, num_openings, embedding_dim=4):
+class PositivesDataset(Dataset):
+    def __init__(self, players: np.ndarray, openings: np.ndarray):
+        self.players = torch.as_tensor(np.ascontiguousarray(players), dtype=torch.long)
+        self.openings = torch.as_tensor(np.ascontiguousarray(openings), dtype=torch.long)
+
+    def __len__(self) -> int:
+        return self.players.shape[0]
+
+    def __getitem__(self, idx: int):
+        return self.players[idx], self.openings[idx]
+
+
+class MFModel(nn.Module):
+    def __init__(self, num_players: int, num_openings: int, dim: int):
         super().__init__()
-        
-        # Embedding layers
-        self.player_embedding = nn.Embedding(num_players, embedding_dim)
-        self.opening_embedding = nn.Embedding(num_openings, embedding_dim)
-        
-        # Input: opening_emb(4) + player_emb(4) + rating(1)
-        concat_dim = embedding_dim * 2 + 1  # 4 + 4 + 1 = 9
-        self.dense = nn.Linear(concat_dim, 3)  # loss/draw/win logits
-    
-    def forward(self, opening_input, player_input, rating_input):
-        if rating_input is None:
-            raise ValueError("rating_input is required.")
+        self.player_emb = nn.Embedding(num_players, dim)
+        self.opening_emb = nn.Embedding(num_openings, dim)
+        self.opening_bias = nn.Embedding(num_openings, 1)
+        nn.init.normal_(self.player_emb.weight, std=0.05)
+        nn.init.normal_(self.opening_emb.weight, std=0.05)
+        nn.init.zeros_(self.opening_bias.weight)
 
-        # Embeddings: [B, 1] -> [B, 1, emb_dim] -> flatten to [B, emb_dim]
-        opening_vec = self.opening_embedding(opening_input).squeeze(1)          # [B, 4]
-        player_vec = self.player_embedding(player_input).squeeze(1)             # [B, 4]
-        rating_input = rating_input.view(-1, 1)
-        
-        # Concatenate all features
-        x = torch.cat([
-            opening_vec,
-            player_vec, 
-            rating_input
-        ], dim=1)  # [B, 9]
-        
-        return self.dense(x)
+    def forward(self, player_ids: torch.Tensor, opening_ids: torch.Tensor) -> torch.Tensor:
+        p = self.player_emb(player_ids)
+        o = self.opening_emb(opening_ids)
+        b = self.opening_bias(opening_ids).squeeze(-1)
+        return (p * o).sum(-1) + b
 
 
 def count_parameters(model: nn.Module) -> tuple[int, int]:
@@ -79,170 +63,129 @@ def count_parameters(model: nn.Module) -> tuple[int, int]:
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
-def collate_fn(batch):
-    """Custom collate function"""
-    players = torch.tensor([b['player'] for b in batch], dtype=torch.long).unsqueeze(1)
-    openings = torch.tensor([b['opening'] for b in batch], dtype=torch.long).unsqueeze(1)
-    ratings = torch.tensor([b['rating'] for b in batch], dtype=torch.float32).unsqueeze(1)
-    results = torch.tensor([b['result'] for b in batch], dtype=torch.long)
-    
-    return openings, players, ratings, results
 
-def prepare_data(csv_path, test_size=0.2):
-    """Load and prepare data"""
+def prepare_data(csv_path: str):
     df = pd.read_csv(csv_path)
-    
-    # Convert result_code to player-perspective class labels: 0=loss, 1=draw, 2=win
-    white_result_map = {0: 0, 1: 2, 2: 1}  # black win=loss, white win=win, draw=draw
-    black_result_map = {0: 2, 1: 0, 2: 1}  # black win=win, white win=loss, draw=draw
-    df['white_result'] = df['result_code'].map(white_result_map)
-    df['black_result'] = df['result_code'].map(black_result_map)
-    
-    # Normalize ratings to [0, 1] using the same scale for both colors
-    rating_min = min(df['white_rating'].min(), df['black_rating'].min())
-    rating_max = max(df['white_rating'].max(), df['black_rating'].max())
-    
-    df['white_rating_norm'] = (df['white_rating'] - rating_min) / (rating_max - rating_min)
-    df['black_rating_norm'] = (df['black_rating'] - rating_min) / (rating_max - rating_min)
 
-    # Expand each game into two samples: one for white, one for black
-    white_samples = df[['white_player_id', 'opening_id', 'white_rating_norm', 'white_result']].copy()
-    white_samples.columns = ['player_id', 'opening_id', 'rating_norm', 'result']
-
-    black_samples = df[['black_player_id', 'opening_id', 'black_rating_norm', 'black_result']].copy()
-    black_samples.columns = ['player_id', 'opening_id', 'rating_norm', 'result']
-
-    samples = pd.concat([white_samples, black_samples], ignore_index=True)
-    
-    # Get embedding dimensions
-    num_players = max(df['white_player_id'].max(), df['black_player_id'].max()) + 1
-    num_openings = df['opening_id'].max() + 1
-    
-    # Split data
-    train_idx, val_idx = train_test_split(
-        np.arange(len(samples)), 
-        test_size=test_size, 
-        random_state=42
+    white = df[['white_player_id', 'opening_id']].rename(
+        columns={'white_player_id': 'player_id'}
     )
-    
+    black = df[['black_player_id', 'opening_id']].rename(
+        columns={'black_player_id': 'player_id'}
+    )
+    samples = pd.concat([white, black], ignore_index=True)
+
+    num_players = int(samples['player_id'].max()) + 1
+    num_openings = int(samples['opening_id'].max()) + 1
+
+    train_idx, val_idx = train_test_split(
+        np.arange(len(samples)), test_size=VAL_SPLIT, random_state=42
+    )
     train_df = samples.iloc[train_idx].reset_index(drop=True)
     val_df = samples.iloc[val_idx].reset_index(drop=True)
-    
-    print(f"Train set: {len(train_df)} samples")
-    print(f"Val set: {len(val_df)} samples")
+
+    print(f"Train positives: {len(train_df)}")
+    print(f"Val positives: {len(val_df)}")
     print(f"Players: {num_players}, Openings: {num_openings}")
-    
+
     return train_df, val_df, num_players, num_openings
 
-def train_epoch(model, train_loader, optimizer, criterion, device):
-    """Train for one epoch"""
-    model.train()
-    total_loss = 0
-    
-    for openings, players, ratings, results in train_loader:
-        openings = openings.to(device)
-        players = players.to(device)
-        ratings = ratings.to(device)
-        results = results.to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(openings, players, ratings)
-        loss = criterion(outputs, results)
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-    
-    return total_loss / len(train_loader)
 
-def validate(model, val_loader, criterion, device):
-    """Validate the model"""
-    model.eval()
-    total_loss = 0
-    
-    with torch.no_grad():
-        for openings, players, ratings, results in val_loader:
-            openings = openings.to(device)
-            players = players.to(device)
-            ratings = ratings.to(device)
-            results = results.to(device)
-            
-            outputs = model(openings, players, ratings)
-            loss = criterion(outputs, results)
-            total_loss += loss.item()
-    
-    return total_loss / len(val_loader)
+def build_batch(player_b: torch.Tensor, opening_b: torch.Tensor, num_openings: int):
+    """Concatenate positives with NEG_PER_POS random negatives per positive."""
+    batch_size = player_b.size(0)
+    neg_openings = torch.randint(
+        0, num_openings, (batch_size, NEG_PER_POS), device=player_b.device
+    )
+    neg_players = player_b.unsqueeze(1).expand(-1, NEG_PER_POS).reshape(-1)
+
+    all_players = torch.cat([player_b, neg_players])
+    all_openings = torch.cat([opening_b, neg_openings.reshape(-1)])
+    labels = torch.cat([
+        torch.ones(batch_size, device=player_b.device),
+        torch.zeros(batch_size * NEG_PER_POS, device=player_b.device),
+    ])
+    return all_players, all_openings, labels
+
+
+def run_epoch(model, loader, num_openings, criterion, optimizer=None):
+    is_train = optimizer is not None
+    model.train(is_train)
+
+    total_loss = 0.0
+    total_correct = 0
+    total_count = 0
+    context = torch.enable_grad() if is_train else torch.no_grad()
+
+    with context:
+        for player_b, opening_b in loader:
+            player_b = player_b.to(device)
+            opening_b = opening_b.to(device)
+
+            players, openings, labels = build_batch(player_b, opening_b, num_openings)
+            logits = model(players, openings)
+            loss = criterion(logits, labels)
+
+            if is_train:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item() * labels.size(0)
+            preds = (torch.sigmoid(logits) > 0.5).float()
+            total_correct += (preds == labels).sum().item()
+            total_count += labels.size(0)
+
+    return total_loss / total_count, total_correct / total_count
+
 
 def main():
-    # Prepare data
     train_df, val_df, num_players, num_openings = prepare_data('games_encoded.csv')
-    
-    # Create datasets
-    train_dataset = ChessDataset(
-        train_df['player_id'].values,
-        train_df['opening_id'].values,
-        train_df['result'].values,
-        train_df['rating_norm'].values
-    )
-    
-    val_dataset = ChessDataset(
-        val_df['player_id'].values,
-        val_df['opening_id'].values,
-        val_df['result'].values,
-        val_df['rating_norm'].values
-    )
-    
+
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=BATCH_SIZE, 
+        PositivesDataset(train_df['player_id'].values, train_df['opening_id'].values),
+        batch_size=BATCH_SIZE,
         shuffle=True,
-        collate_fn=collate_fn
     )
-    
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=BATCH_SIZE, 
+        PositivesDataset(val_df['player_id'].values, val_df['opening_id'].values),
+        batch_size=BATCH_SIZE,
         shuffle=False,
-        collate_fn=collate_fn
     )
-    
-    # Initialize model
-    model = TFStyleChessModel(
-        num_players=num_players,
-        num_openings=num_openings,
-        embedding_dim=EMBEDDING_DIM
-    ).to(device)
-    
-    print(f"\nModel architecture:")
+
+    model = MFModel(num_players, num_openings, EMBEDDING_DIM).to(device)
+    print("\nModel architecture:")
     print(model)
     total_params, trainable_params = count_parameters(model)
     print(f"Total params: {total_params}")
     print(f"Trainable params: {trainable_params}")
-    
-    # Training setup
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min', 
-        factor=0.5, 
-        patience=5
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
     )
-    
-    # Training loop
-    print(f"\nStarting training for {EPOCHS} epochs...")
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3
+    )
+
+    print(f"\nTraining for {EPOCHS} epochs (neg/pos = {NEG_PER_POS})")
     best_val_loss = float('inf')
     patience_counter = 0
-    patience = 15
-    
+    patience = 8
+
     for epoch in range(EPOCHS):
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss = validate(model, val_loader, criterion, device)
-        
+        train_loss, train_acc = run_epoch(
+            model, train_loader, num_openings, criterion, optimizer
+        )
+        val_loss, val_acc = run_epoch(model, val_loader, num_openings, criterion)
         scheduler.step(val_loss)
-        
-        print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        
+
+        print(
+            f"Epoch {epoch + 1}/{EPOCHS} | "
+            f"train loss {train_loss:.4f} acc {train_acc:.3f} | "
+            f"val loss {val_loss:.4f} acc {val_acc:.3f}"
+        )
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -250,13 +193,15 @@ def main():
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\nEarly stopping after {epoch+1} epochs")
+                print(f"\nEarly stopping after {epoch + 1} epochs")
                 break
-    
-    # Load and save best model
+
     model.load_state_dict(torch.load('best_tf_style_model.pth'))
     torch.save(model.state_dict(), 'tf_style_model.pth')
-    print(f"✓ Model saved to tf_style_model.pth")
+    np.save('player_embeddings.npy', model.player_emb.weight.detach().cpu().numpy())
+    np.save('opening_embeddings.npy', model.opening_emb.weight.detach().cpu().numpy())
+    print("Saved tf_style_model.pth, player_embeddings.npy, opening_embeddings.npy")
+
 
 if __name__ == '__main__':
     main()
